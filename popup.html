@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Macro Recorder</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <span class="title">⚡ Macro Recorder</span>
+    <span class="status-dot" id="statusDot"></span>
+  </div>
+
+  <!-- Record Controls -->
+  <div class="section" id="recordSection">
+    <div class="row">
+      <button id="btnRecord" class="btn btn-record">🔴 Record</button>
+      <button id="btnStop" class="btn btn-stop" disabled>⏹ Stop</button>
+    </div>
+    <div class="counter" id="actionCount">0 actions</div>
+  </div>
+
+  <!-- Save Current Macro -->
+  <div class="section" id="saveSection" style="display:none">
+    <div class="save-row">
+      <input type="text" id="macroName" placeholder="Macro name..." maxlength="40">
+      <button id="btnSave" class="btn btn-save">💾 Save</button>
+    </div>
+    <button id="btnPlayCurrent" class="btn btn-play full-width">▶ Play Current</button>
+  </div>
+
+  <!-- Saved Macros -->
+  <div class="section" id="macroListSection">
+    <div class="section-label">Saved Macros</div>
+    <div id="macroList" class="macro-list">
+      <div class="empty-state">No saved macros yet.</div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
