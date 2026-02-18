@@ -12,13 +12,36 @@ const saveSection   = $('saveSection');
 const macroList     = $('macroList');
 
 let currentMacro = [];
+let replaySpeed = 1;
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 (async () => {
   const state = await bg('GET_STATE');
   updateUI(state);
   loadMacroList();
+
+  // Restore saved speed
+  const stored = await new Promise(r => chrome.storage.local.get('replaySpeed', r));
+  if (stored.replaySpeed) {
+    replaySpeed = stored.replaySpeed;
+    setActiveSpeed(replaySpeed);
+  }
 })();
+
+// ─── Speed Buttons ────────────────────────────────────────────────────────────
+document.querySelectorAll('.speed-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    replaySpeed = parseFloat(btn.dataset.speed);
+    setActiveSpeed(replaySpeed);
+    chrome.storage.local.set({ replaySpeed });
+  });
+});
+
+function setActiveSpeed(speed) {
+  document.querySelectorAll('.speed-btn').forEach(b => {
+    b.classList.toggle('active', parseFloat(b.dataset.speed) === speed);
+  });
+}
 
 // ─── Button Handlers ──────────────────────────────────────────────────────────
 btnRecord.addEventListener('click', async () => {
@@ -53,9 +76,9 @@ btnSave.addEventListener('click', async () => {
 
 btnPlayCurrent.addEventListener('click', async () => {
   if (!currentMacro.length) return;
-  await bg('START_REPLAY', { macro: currentMacro });
+  await bg('START_REPLAY', { macro: currentMacro, speed: replaySpeed });
   updateUI({ isRecording: false, isReplaying: true });
-  window.close(); // close popup so page is accessible
+  window.close();
 });
 
 // ─── Macro List ───────────────────────────────────────────────────────────────
@@ -109,7 +132,7 @@ async function loadMacroList() {
       const res2 = await bg('GET_MACROS');
       const macro = res2.macros?.[name]?.actions;
       if (!macro) return;
-      await bg('START_REPLAY', { macro });
+      await bg('START_REPLAY', { macro, speed: replaySpeed });
       window.close();
     });
 

@@ -33,7 +33,7 @@
         break;
 
       case 'REPLAY_ACTION':
-        replayAction(msg.action).then(() => {
+        replayAction(msg.action, msg.postDelay || 400).then(() => {
           if (!navigating) {
             chrome.runtime.sendMessage({ type: 'ACTION_DONE' }, () => chrome.runtime.lastError);
           }
@@ -161,32 +161,36 @@
   }
 
   // ── Replay: execute actions ───────────────────────────────────────────────
-  async function replayAction(action) {
+  async function replayAction(action, postDelay) {
     navigating = false;
 
     if (action.type === 'navigate') return; // just a breadcrumb
 
+    showStepToast(action);
+
     const el = await waitForElement(action);
     if (!el) {
       console.warn('[Macro] Could not find element:', action.selector);
-      showToast(`⚠️ Could not find element — skipping`);
+      showToast(`⚠️ Could not find element — skipping step`);
+      await sleep(postDelay || 400);
       return;
     }
 
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await sleep(200);
+    await sleep(120);
 
     if (action.type === 'fill') {
       el.focus();
-      // Clear and set value in a way that React/Vue apps pick up
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype, 'value'
+      await sleep(80);
+      // Use native setter so React/Vue controlled inputs pick up the change
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        el.tagName === 'TEXTAREA'
+          ? window.HTMLTextAreaElement.prototype
+          : window.HTMLInputElement.prototype,
+        'value'
       )?.set;
-      if (nativeInputValueSetter) {
-        nativeInputValueSetter.call(el, action.value);
-      } else {
-        el.value = action.value;
-      }
+      if (nativeSetter) nativeSetter.call(el, action.value);
+      else el.value = action.value;
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
 
@@ -206,7 +210,6 @@
         chrome.runtime.sendMessage({ type: 'ACTION_NAVIGATED' }, () => chrome.runtime.lastError);
       }
 
-      // For checkboxes, set the recorded checked state
       if (action.inputType === 'checkbox' && action.checked !== undefined) {
         if (el.checked !== action.checked) el.click();
       } else {
@@ -214,18 +217,46 @@
       }
     }
 
-    await sleep(150);
+    // Wait the recorded inter-action gap before signalling done.
+    // This is what makes the replay pause appropriately for popups/loaders.
+    if (!navigating) await sleep(postDelay || 400);
   }
 
   // ── Element finding ───────────────────────────────────────────────────────
-  async function waitForElement(action, timeout = 8000) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      const el = findElement(action);
-      if (el) return el;
-      await sleep(200);
-    }
-    return null;
+  // MutationObserver-based: reacts the instant a popup/element appears in the DOM
+  // rather than polling every 200ms. Falls back to a timeout.
+  function waitForElement(action, timeout = 15000) {
+    // Check immediately — element might already be there
+    const immediate = findElement(action);
+    if (immediate) return Promise.resolve(immediate);
+
+    return new Promise((resolve) => {
+      let done = false;
+
+      const finish = (el) => {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(el);
+      };
+
+      const observer = new MutationObserver(() => {
+        const el = findElement(action);
+        if (el) finish(el);
+      });
+
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        // Also watch for attribute changes — handles show/hide via class or style
+        attributes: true,
+        attributeFilter: ['style', 'class', 'hidden', 'disabled', 'aria-hidden'],
+      });
+
+      // Hard timeout — give up after 15s and skip the step
+      const timer = setTimeout(() => finish(null), timeout);
+    });
   }
 
   function findElement(action) {
@@ -314,6 +345,15 @@
 
   // ── Utilities ─────────────────────────────────────────────────────────────
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function showStepToast(action) {
+    const labels = {
+      click: `🖱 Click: ${action.text || action.selector?.substring(0, 40) || '?'}`,
+      fill:  `⌨️ Type into: ${action.placeholder || action.selector?.substring(0, 40) || '?'}`,
+      select:`📋 Select: ${action.label || action.value || '?'}`,
+    };
+    showToast(labels[action.type] || `▶ ${action.type}`);
+  }
 
   function showToast(text) {
     const id = '__macro_toast__';

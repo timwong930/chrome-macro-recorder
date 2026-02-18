@@ -96,6 +96,34 @@ body {
   margin-bottom: 8px;
 }
 
+.speed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.speed-btns {
+  display: flex;
+  gap: 4px;
+}
+
+.speed-btn {
+  background: #1e1e30;
+  border: 1px solid #3a3a5a;
+  border-radius: 6px;
+  color: #aaaacc;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px 10px;
+  transition: all 0.15s;
+}
+.speed-btn:hover { background: #2a2a42; }
+.speed-btn.active {
+  background: #2d2d5a;
+  border-color: #7070cc;
+  color: #fff;
+}
+
 .macro-list {
   max-height: 200px;
   overflow-y: auto;

@@ -109,7 +109,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // ── Replay ────────────────────────────────────────────────────────────────
     case 'START_REPLAY':
-      startReplay(msg.macro);
+      startReplay(msg.macro, msg.speed);
       sendResponse({ ok: true });
       break;
 
@@ -153,11 +153,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 // ─── Replay helpers ───────────────────────────────────────────────────────────
-function startReplay(macro) {
+function startReplay(macro, speed) {
   state.isReplaying = true;
   state.replayIndex = 0;
   state.replayMacro = macro;
   state.replayPaused = false;
+  state.replaySpeed = speed || 1; // 0.5 = half-speed (longer waits), 2 = double-speed
 
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (!tabs[0]) return;
@@ -177,8 +178,28 @@ function sendReplayAction(tabId) {
     chrome.tabs.sendMessage(tabId, { type: 'REPLAY_COMPLETE' });
     return;
   }
-  const action = state.replayMacro[state.replayIndex++];
-  chrome.tabs.sendMessage(tabId, { type: 'REPLAY_ACTION', action }, () => chrome.runtime.lastError);
+
+  const action = state.replayMacro[state.replayIndex];
+  const nextAction = state.replayMacro[state.replayIndex + 1];
+  state.replayIndex++;
+
+  // Calculate how long to pause AFTER this action before requesting the next one.
+  // Based on the gap between recorded timestamps, scaled by replaySpeed.
+  // This naturally handles: "Tim waited 3s for a popup → replay waits 3s too."
+  let postDelay = 400; // sensible default
+  if (nextAction?.timestamp && action?.timestamp) {
+    const recorded = nextAction.timestamp - action.timestamp;
+    const speed = state.replaySpeed || 1;
+    // scale: speed=2 → half the recorded delay (faster); speed=0.5 → 2x delay (slower)
+    postDelay = Math.round(recorded / speed);
+    postDelay = Math.max(200, Math.min(postDelay, 15000)); // clamp 200ms–15s
+  }
+
+  chrome.tabs.sendMessage(
+    tabId,
+    { type: 'REPLAY_ACTION', action, postDelay },
+    () => chrome.runtime.lastError
+  );
 }
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
