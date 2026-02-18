@@ -33,6 +33,13 @@ btnStop.addEventListener('click', async () => {
   stopCountPoller();
   const res = await bg('STOP_RECORDING');
   currentMacro = res.macro || [];
+
+  // Fallback: if background returned empty, read directly from session storage
+  if (currentMacro.length === 0) {
+    const stored = await new Promise(r => chrome.storage.session.get('currentMacro', r));
+    if (stored.currentMacro?.length) currentMacro = stored.currentMacro;
+  }
+
   updateUI({ isRecording: false, isReplaying: false, actionCount: currentMacro.length });
 });
 

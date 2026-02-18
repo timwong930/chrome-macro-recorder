@@ -5,6 +5,16 @@
 
   let recording = false;
   let navigating = false;
+  // Track last known value per selector to deduplicate input events
+  const inputValues = new Map();
+
+  // On page load, check if we should be recording (survives page navigation)
+  chrome.storage.session.get('isRecording', (data) => {
+    if (data.isRecording) {
+      recording = true;
+      showToast('🔴 Recording...');
+    }
+  });
 
   // ── Listen for commands from background ──────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -18,13 +28,14 @@
       case 'STOP_RECORDING':
         recording = false;
         showToast('⏹ Recording stopped');
+        inputValues.clear();
         sendResponse({ ok: true });
         break;
 
       case 'REPLAY_ACTION':
         replayAction(msg.action).then(() => {
           if (!navigating) {
-            chrome.runtime.sendMessage({ type: 'ACTION_DONE' });
+            chrome.runtime.sendMessage({ type: 'ACTION_DONE' }, () => chrome.runtime.lastError);
           }
         });
         sendResponse({ ok: true });
@@ -38,158 +49,227 @@
     return true;
   });
 
-  // ── Recording: capture events ─────────────────────────────────────────────
+  // ── Recording: capture clicks ─────────────────────────────────────────────
   document.addEventListener('click', (e) => {
     if (!recording) return;
     if (!e.target || typeof e.target.closest !== 'function') return;
-    const target = e.target.closest('button, a, input[type=submit], input[type=button], input[type=checkbox], input[type=radio], [role=button], select, label');
+
+    const target = e.target.closest(
+      'button, a, input[type=submit], input[type=button], ' +
+      'input[type=checkbox], input[type=radio], [role=button], select, label'
+    );
     if (!target) return;
 
-    const action = {
+    // Flush any pending input value before recording the click
+    flushActiveInput();
+
+    recordAction({
       type: 'click',
       selector: getSelector(target),
       selectorAlts: getSelectorAlts(target),
-      text: target.textContent?.trim().substring(0, 80) || '',
+      text: (target.textContent || target.value || target.getAttribute('aria-label') || '').trim().substring(0, 100),
       tag: target.tagName.toLowerCase(),
-      url: location.href,
-      timestamp: Date.now(),
-    };
-
-    chrome.runtime.sendMessage({ type: 'RECORD_ACTION', action });
+      inputType: target.type || null,
+      checked: target.type === 'checkbox' || target.type === 'radio' ? target.checked : undefined,
+    });
   }, true);
 
+  // ── Recording: capture text input (fires on every keystroke) ─────────────
+  document.addEventListener('input', (e) => {
+    if (!recording) return;
+    const target = e.target;
+    if (!['INPUT', 'TEXTAREA'].includes(target.tagName)) return;
+    const inputType = (target.type || '').toLowerCase();
+    if (['checkbox', 'radio', 'submit', 'button', 'file'].includes(inputType)) return;
+
+    // Store the latest value; we'll flush it on blur or before a click
+    const sel = getSelector(target);
+    inputValues.set(sel, { target, value: target.value });
+  }, true);
+
+  // ── Recording: flush input values on blur ─────────────────────────────────
+  document.addEventListener('blur', (e) => {
+    if (!recording) return;
+    const target = e.target;
+    if (!['INPUT', 'TEXTAREA'].includes(target.tagName)) return;
+    const sel = getSelector(target);
+    const pending = inputValues.get(sel);
+    if (pending) {
+      sendFillAction(target, sel);
+      inputValues.delete(sel);
+    }
+  }, true);
+
+  // ── Recording: capture select dropdowns ──────────────────────────────────
   document.addEventListener('change', (e) => {
     if (!recording) return;
     const target = e.target;
-    if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+    if (target.tagName !== 'SELECT') return;
 
-    const inputType = target.type?.toLowerCase();
-    if (['checkbox', 'radio', 'submit', 'button'].includes(inputType)) return; // handled by click
-
-    const action = {
-      type: target.tagName === 'SELECT' ? 'select' : 'fill',
+    recordAction({
+      type: 'select',
       selector: getSelector(target),
       selectorAlts: getSelectorAlts(target),
       value: target.value,
-      tag: target.tagName.toLowerCase(),
-      url: location.href,
-      timestamp: Date.now(),
-    };
-
-    chrome.runtime.sendMessage({ type: 'RECORD_ACTION', action });
+      label: target.options[target.selectedIndex]?.text || target.value,
+      tag: 'select',
+    });
   }, true);
 
-  // Detect navigation
+  // ── Detect navigation ─────────────────────────────────────────────────────
   window.addEventListener('beforeunload', () => {
-    if (recording) {
-      navigating = true;
-      chrome.runtime.sendMessage({
-        type: 'RECORD_ACTION',
-        action: { type: 'navigate', url: location.href, timestamp: Date.now() }
-      });
+    if (!recording) return;
+    // Flush any pending input
+    for (const [sel, { target }] of inputValues.entries()) {
+      sendFillAction(target, sel);
     }
+    inputValues.clear();
+    navigating = true;
+    recordAction({ type: 'navigate', url: location.href });
   });
+
+  // ── Helpers: send fill action ─────────────────────────────────────────────
+  function sendFillAction(target, sel) {
+    recordAction({
+      type: 'fill',
+      selector: sel,
+      selectorAlts: getSelectorAlts(target),
+      value: target.value,
+      tag: target.tagName.toLowerCase(),
+      inputType: target.type || null,
+      placeholder: target.placeholder || null,
+    });
+  }
+
+  function flushActiveInput() {
+    // Flush whichever input currently has focus
+    const active = document.activeElement;
+    if (!active) return;
+    if (!['INPUT', 'TEXTAREA'].includes(active.tagName)) return;
+    const sel = getSelector(active);
+    if (inputValues.has(sel)) {
+      sendFillAction(active, sel);
+      inputValues.delete(sel);
+    }
+  }
+
+  function recordAction(action) {
+    chrome.runtime.sendMessage(
+      { type: 'RECORD_ACTION', action: { ...action, url: location.href, timestamp: Date.now() } },
+      () => chrome.runtime.lastError // suppress errors
+    );
+  }
 
   // ── Replay: execute actions ───────────────────────────────────────────────
   async function replayAction(action) {
     navigating = false;
 
-    if (action.type === 'navigate') {
-      // No-op, just a breadcrumb
-      return;
-    }
+    if (action.type === 'navigate') return; // just a breadcrumb
 
     const el = await waitForElement(action);
     if (!el) {
-      console.warn('[Macro] Could not find element for action:', action);
-      showToast(`⚠️ Element not found: ${action.selector?.substring(0, 40)}`);
+      console.warn('[Macro] Could not find element:', action.selector);
+      showToast(`⚠️ Could not find element — skipping`);
       return;
     }
 
-    // Scroll into view
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    await sleep(150);
+    await sleep(200);
 
     if (action.type === 'fill') {
       el.focus();
-      el.value = '';
-      el.value = action.value;
+      // Clear and set value in a way that React/Vue apps pick up
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value'
+      )?.set;
+      if (nativeInputValueSetter) {
+        nativeInputValueSetter.call(el, action.value);
+      } else {
+        el.value = action.value;
+      }
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+
     } else if (action.type === 'select') {
       el.focus();
       el.value = action.value;
       el.dispatchEvent(new Event('change', { bubbles: true }));
+
     } else if (action.type === 'click') {
-      // Check if click will navigate
       const willNavigate = (
         (el.tagName === 'A' && el.href && !el.href.startsWith('javascript:')) ||
         el.type === 'submit' ||
-        el.closest('form') && el.type === 'submit'
+        (el.closest('form') && el.type === 'submit')
       );
-
       if (willNavigate) {
         navigating = true;
-        chrome.runtime.sendMessage({ type: 'ACTION_NAVIGATED' });
+        chrome.runtime.sendMessage({ type: 'ACTION_NAVIGATED' }, () => chrome.runtime.lastError);
       }
 
-      el.click();
+      // For checkboxes, set the recorded checked state
+      if (action.inputType === 'checkbox' && action.checked !== undefined) {
+        if (el.checked !== action.checked) el.click();
+      } else {
+        el.click();
+      }
     }
 
-    await sleep(100);
+    await sleep(150);
   }
 
   // ── Element finding ───────────────────────────────────────────────────────
-  async function waitForElement(action, timeout = 7000) {
+  async function waitForElement(action, timeout = 8000) {
     const start = Date.now();
     while (Date.now() - start < timeout) {
       const el = findElement(action);
       if (el) return el;
-      await sleep(150);
+      await sleep(200);
     }
     return null;
   }
 
   function findElement(action) {
-    // Try all stored selectors in priority order
     const selectors = [action.selector, ...(action.selectorAlts || [])].filter(Boolean);
 
     for (const sel of selectors) {
       try {
         const el = document.querySelector(sel);
         if (el && isVisible(el)) return el;
-      } catch (e) { /* invalid selector */ }
+      } catch (_) {}
     }
 
-    // Fallback: text match for buttons/links
-    if (action.text && ['button', 'a', 'input'].includes(action.tag)) {
-      const candidates = document.querySelectorAll(
-        `${action.tag}, [role=button]`
-      );
-      for (const el of candidates) {
-        if (el.textContent?.trim() === action.text && isVisible(el)) return el;
+    // Text-content fallback for buttons and links
+    if (action.text) {
+      const tags = action.tag ? [action.tag, '[role=button]'] : ['button', 'a', '[role=button]'];
+      for (const tag of tags) {
+        for (const el of document.querySelectorAll(tag)) {
+          const elText = (el.textContent || el.value || '').trim();
+          if (elText === action.text && isVisible(el)) return el;
+        }
       }
+    }
+
+    // Placeholder fallback for inputs
+    if (action.placeholder) {
+      const el = document.querySelector(`[placeholder="${CSS.escape(action.placeholder)}"]`);
+      if (el && isVisible(el)) return el;
     }
 
     return null;
   }
 
   function isVisible(el) {
-    const rect = el.getBoundingClientRect();
+    if (!el) return false;
     const style = getComputedStyle(el);
-    return (
-      style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
-      style.opacity !== '0' &&
-      (rect.width > 0 || rect.height > 0)
-    );
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 || rect.height > 0;
   }
 
   // ── Selector Generation ───────────────────────────────────────────────────
   function getSelector(el) {
-    // Best unique selector
     if (el.id) return `#${CSS.escape(el.id)}`;
-    if (el.getAttribute('data-testid')) return `[data-testid="${el.getAttribute('data-testid')}"]`;
+    if (el.getAttribute('data-testid')) return `[data-testid="${CSS.escape(el.getAttribute('data-testid'))}"]`;
     if (el.getAttribute('aria-label')) return `[aria-label="${CSS.escape(el.getAttribute('aria-label'))}"]`;
     if (el.name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
     return buildCSSPath(el);
@@ -197,16 +277,18 @@
 
   function getSelectorAlts(el) {
     const alts = [];
-    // Collect multiple fallback selectors
-    if (el.className && typeof el.className === 'string') {
-      const cls = el.className.trim().split(/\s+/).filter(c => c && !c.match(/^(active|hover|focus|selected|is-)/));
-      if (cls.length) alts.push(`${el.tagName.toLowerCase()}.${cls.map(c => CSS.escape(c)).join('.')}`);
-    }
     if (el.getAttribute('placeholder')) {
       alts.push(`[placeholder="${CSS.escape(el.getAttribute('placeholder'))}"]`);
     }
     if (el.getAttribute('type') && el.name) {
       alts.push(`input[type="${el.getAttribute('type')}"][name="${CSS.escape(el.name)}"]`);
+    }
+    if (el.className && typeof el.className === 'string') {
+      const cls = el.className.trim().split(/\s+/)
+        .filter(c => c && !/^(active|hover|focus|selected|is-|has-)/.test(c));
+      if (cls.length && cls.length <= 4) {
+        alts.push(`${el.tagName.toLowerCase()}.${cls.map(c => CSS.escape(c)).join('.')}`);
+      }
     }
     alts.push(buildCSSPath(el));
     return [...new Set(alts)].slice(0, 4);
@@ -216,29 +298,22 @@
     const parts = [];
     let node = el;
     while (node && node.tagName && node.tagName !== 'HTML') {
+      if (node.id) { parts.unshift(`#${CSS.escape(node.id)}`); break; }
       let part = node.tagName.toLowerCase();
-      if (node.id) {
-        parts.unshift(`#${CSS.escape(node.id)}`);
-        break;
-      }
       const parent = node.parentElement;
       if (parent) {
         const siblings = Array.from(parent.children).filter(c => c.tagName === node.tagName);
-        if (siblings.length > 1) {
-          part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
-        }
+        if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
       }
       parts.unshift(part);
       node = node.parentElement;
-      if (parts.length >= 6) break; // cap depth
+      if (parts.length >= 6) break;
     }
     return parts.join(' > ');
   }
 
   // ── Utilities ─────────────────────────────────────────────────────────────
-  function sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
-  }
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   function showToast(text) {
     const id = '__macro_toast__';
@@ -246,19 +321,19 @@
     if (!el) {
       el = document.createElement('div');
       el.id = id;
-      el.style.cssText = `
-        position: fixed; top: 16px; right: 16px; z-index: 2147483647;
-        background: #1a1a2e; color: #fff; border-radius: 8px;
-        padding: 10px 16px; font: 14px/1.4 system-ui, sans-serif;
-        box-shadow: 0 4px 20px rgba(0,0,0,.4);
-        transition: opacity 0.3s; pointer-events: none;
-      `;
+      Object.assign(el.style, {
+        position: 'fixed', top: '16px', right: '16px', zIndex: '2147483647',
+        background: '#1a1a2e', color: '#fff', borderRadius: '8px',
+        padding: '10px 16px', font: '14px/1.4 system-ui,sans-serif',
+        boxShadow: '0 4px 20px rgba(0,0,0,.4)',
+        transition: 'opacity 0.3s', pointerEvents: 'none',
+      });
       document.body.appendChild(el);
     }
     el.textContent = text;
     el.style.opacity = '1';
-    clearTimeout(el._timeout);
-    el._timeout = setTimeout(() => el.style.opacity = '0', 2500);
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { el.style.opacity = '0'; }, 2500);
   }
 
 })();

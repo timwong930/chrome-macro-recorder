@@ -1,4 +1,4 @@
-// ─── State ───────────────────────────────────────────────────────────────────
+// ─── State (in-memory cache; session storage is the source of truth) ─────────
 let state = {
   isRecording: false,
   isReplaying: false,
@@ -6,8 +6,31 @@ let state = {
   replayMacro: [],
   replayIndex: 0,
   replayTabId: null,
-  replayPaused: false, // paused waiting for page load
+  replayPaused: false,
 };
+
+// Restore from session storage on service worker startup
+// (Chrome MV3 kills the service worker when idle; this revives it)
+chrome.storage.session.get(['isRecording', 'currentMacro'], (data) => {
+  if (data.isRecording) state.isRecording = data.isRecording;
+  if (data.currentMacro) state.currentMacro = data.currentMacro;
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function persistRecordingState() {
+  chrome.storage.session.set({
+    isRecording: state.isRecording,
+    currentMacro: state.currentMacro,
+  });
+}
+
+function broadcastToActiveTab(msg) {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs[0]) {
+      chrome.tabs.sendMessage(tabs[0].id, msg, () => chrome.runtime.lastError);
+    }
+  });
+}
 
 // ─── Message Router ───────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -21,10 +44,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       });
       break;
 
-    // ── Recording ──
+    // ── Recording ─────────────────────────────────────────────────────────────
     case 'START_RECORDING':
       state.isRecording = true;
       state.currentMacro = [];
+      persistRecordingState();
       broadcastToActiveTab({ type: 'START_RECORDING' });
       sendResponse({ ok: true });
       break;
@@ -32,21 +56,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'STOP_RECORDING':
       state.isRecording = false;
       broadcastToActiveTab({ type: 'STOP_RECORDING' });
+      persistRecordingState();
       sendResponse({ macro: state.currentMacro, count: state.currentMacro.length });
       break;
 
-    case 'RECORD_ACTION':
-      if (state.isRecording) {
-        state.currentMacro.push(msg.action);
-        console.log('[Macro] Recorded:', msg.action.type, msg.action.selector);
-      }
-      sendResponse({ ok: true, total: state.currentMacro.length });
-      break;
+    case 'RECORD_ACTION': {
+      // Re-check session storage in case service worker restarted mid-recording
+      const addAction = () => {
+        if (state.isRecording) {
+          // Deduplicate consecutive fill actions on the same selector
+          const last = state.currentMacro[state.currentMacro.length - 1];
+          if (
+            msg.action.type === 'fill' &&
+            last?.type === 'fill' &&
+            last?.selector === msg.action.selector
+          ) {
+            state.currentMacro[state.currentMacro.length - 1] = msg.action;
+          } else {
+            state.currentMacro.push(msg.action);
+          }
+          persistRecordingState();
+          console.log(`[Macro] Recorded #${state.currentMacro.length}:`, msg.action.type, msg.action.selector || msg.action.value);
+        }
+        sendResponse({ ok: true, total: state.currentMacro.length });
+      };
 
-    // ── Storage ──
+      if (!state.isRecording) {
+        // Service worker may have restarted - check session storage
+        chrome.storage.session.get(['isRecording', 'currentMacro'], (data) => {
+          state.isRecording = data.isRecording || false;
+          state.currentMacro = data.currentMacro || [];
+          addAction();
+        });
+        return true; // async
+      }
+      addAction();
+      break;
+    }
+
+    // ── Storage ───────────────────────────────────────────────────────────────
     case 'SAVE_MACRO':
       saveMacro(msg.name, msg.macro || state.currentMacro, () => sendResponse({ ok: true }));
-      return true; // async
+      return true;
 
     case 'DELETE_MACRO':
       deleteMacro(msg.name, () => sendResponse({ ok: true }));
@@ -56,7 +107,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.storage.local.get('macros', (data) => sendResponse({ macros: data.macros || {} }));
       return true;
 
-    // ── Replay ──
+    // ── Replay ────────────────────────────────────────────────────────────────
     case 'START_REPLAY':
       startReplay(msg.macro);
       sendResponse({ ok: true });
@@ -70,13 +121,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       break;
 
     case 'ACTION_DONE':
-      // Content script finished one action; move to next
       replayNext();
       sendResponse({ ok: true });
       break;
 
     case 'ACTION_NAVIGATED':
-      // Content script detected navigation - pause and wait for tab update
       state.replayPaused = true;
       sendResponse({ ok: true });
       break;
@@ -84,23 +133,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-// ─── Tab load listener (resume replay after page navigation) ─────────────────
+// ─── Tab load: resume replay or recording after navigation ───────────────────
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (
-    state.isReplaying &&
-    state.replayPaused &&
-    tabId === state.replayTabId &&
-    changeInfo.status === 'complete'
-  ) {
+  if (changeInfo.status !== 'complete') return;
+
+  // Resume replay after page load
+  if (state.isReplaying && state.replayPaused && tabId === state.replayTabId) {
     state.replayPaused = false;
-    // Small delay to let page scripts initialize
+    setTimeout(() => sendReplayAction(tabId), 700);
+  }
+
+  // Resume recording on new page (content script checks session storage itself,
+  // but send the message too as a fast-path)
+  if (state.isRecording) {
     setTimeout(() => {
-      // Re-inject start recording if recording
-      if (state.isRecording) {
-        chrome.tabs.sendMessage(tabId, { type: 'START_RECORDING' });
-      }
-      sendReplayAction(tabId);
-    }, 600);
+      chrome.tabs.sendMessage(tabId, { type: 'START_RECORDING' }, () => chrome.runtime.lastError);
+    }, 300);
   }
 });
 
@@ -129,22 +177,15 @@ function sendReplayAction(tabId) {
     chrome.tabs.sendMessage(tabId, { type: 'REPLAY_COMPLETE' });
     return;
   }
-
-  const action = state.replayMacro[state.replayIndex];
-  state.replayIndex++;
-
-  chrome.tabs.sendMessage(tabId, { type: 'REPLAY_ACTION', action }, (response) => {
-    if (chrome.runtime.lastError) {
-      console.warn('[Macro] Replay send error:', chrome.runtime.lastError.message);
-    }
-  });
+  const action = state.replayMacro[state.replayIndex++];
+  chrome.tabs.sendMessage(tabId, { type: 'REPLAY_ACTION', action }, () => chrome.runtime.lastError);
 }
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 function saveMacro(name, macro, cb) {
   chrome.storage.local.get('macros', (data) => {
     const macros = data.macros || {};
-    macros[name] = { actions: macro, savedAt: Date.now() };
+    macros[name] = { actions: macro, savedAt: Date.now(), count: macro.length };
     chrome.storage.local.set({ macros }, cb);
   });
 }
@@ -154,12 +195,5 @@ function deleteMacro(name, cb) {
     const macros = data.macros || {};
     delete macros[name];
     chrome.storage.local.set({ macros }, cb);
-  });
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function broadcastToActiveTab(msg) {
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (tabs[0]) chrome.tabs.sendMessage(tabs[0].id, msg, () => chrome.runtime.lastError);
   });
 }
