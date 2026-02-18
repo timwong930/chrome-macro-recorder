@@ -41,7 +41,8 @@
   // ── Recording: capture events ─────────────────────────────────────────────
   document.addEventListener('click', (e) => {
     if (!recording) return;
-    const target = e.target.closest('button, a, input[type=submit], input[type=button], input[type=checkbox], input[type=radio], [role=button], [onclick], select, label');
+    if (!e.target || typeof e.target.closest !== 'function') return;
+    const target = e.target.closest('button, a, input[type=submit], input[type=button], input[type=checkbox], input[type=radio], [role=button], select, label');
     if (!target) return;
 
     const action = {

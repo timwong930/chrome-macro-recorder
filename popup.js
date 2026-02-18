@@ -58,7 +58,11 @@ async function loadMacroList() {
   const names = Object.keys(macros);
 
   if (!names.length) {
-    macroList.innerHTML = '<div class="empty-state">No saved macros yet.</div>';
+    macroList.textContent = '';
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = 'No saved macros yet.';
+    macroList.appendChild(empty);
     return;
   }
 
@@ -69,14 +73,32 @@ async function loadMacroList() {
 
     const item = document.createElement('div');
     item.className = 'macro-item';
-    item.innerHTML = `
-      <span class="macro-name" title="${escHtml(name)}">${escHtml(name)}</span>
-      <span class="macro-meta">${count} steps</span>
-      <button class="btn-play-small" data-name="${escHtml(name)}">▶ Play</button>
-      <button class="btn-delete" data-name="${escHtml(name)}" title="Delete">✕</button>
-    `;
 
-    item.querySelector('.btn-play-small').addEventListener('click', async () => {
+    // Build DOM nodes instead of innerHTML (MV3 Trusted Types compliance)
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'macro-name';
+    nameSpan.title = name;
+    nameSpan.textContent = name;
+
+    const metaSpan = document.createElement('span');
+    metaSpan.className = 'macro-meta';
+    metaSpan.textContent = `${count} steps`;
+
+    const playBtn = document.createElement('button');
+    playBtn.className = 'btn-play-small';
+    playBtn.textContent = '▶ Play';
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn-delete';
+    delBtn.title = 'Delete';
+    delBtn.textContent = '✕';
+
+    item.appendChild(nameSpan);
+    item.appendChild(metaSpan);
+    item.appendChild(playBtn);
+    item.appendChild(delBtn);
+
+    playBtn.addEventListener('click', async () => {
       const res2 = await bg('GET_MACROS');
       const macro = res2.macros?.[name]?.actions;
       if (!macro) return;
@@ -84,7 +106,7 @@ async function loadMacroList() {
       window.close();
     });
 
-    item.querySelector('.btn-delete').addEventListener('click', async () => {
+    delBtn.addEventListener('click', async () => {
       await bg('DELETE_MACRO', { name });
       loadMacroList();
     });
